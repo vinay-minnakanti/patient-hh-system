@@ -1,19 +1,25 @@
-# health-records-service/main.py
+# ✅ FASTAPI - health-records-service/main.py (no .env, only AWS Secrets Manager)
+
+import boto3, json, os
 from fastapi import FastAPI, HTTPException, Depends, Header, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List
-import psycopg2
-import os
-import jwt
-import boto3
-from uuid import uuid4
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from dotenv import load_dotenv
-load_dotenv()
+from uuid import uuid4
+import psycopg2
+import jwt
+import boto3
 
+# Step 1: Load secrets from AWS Secrets Manager
+def load_secrets():
+    client = boto3.client("secretsmanager", region_name="us-east-2")
+    secret = client.get_secret_value(SecretId="patient-health-system-secrets")
+    secrets = json.loads(secret["SecretString"])
+    os.environ.update(secrets)
 
+load_secrets()
 
+# Step 2: FastAPI Setup
 app = FastAPI()
 
 app.add_middleware(
@@ -24,16 +30,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# DB Connection
-DATABASE_URL = os.getenv("DATABASE_URL")
-conn = psycopg2.connect(DATABASE_URL)
+# Step 3: Database & AWS Clients
+conn = psycopg2.connect(os.getenv("DATABASE_URL"))
 cur = conn.cursor()
 
+s3 = boto3.client(
+    's3',
+    region_name=os.getenv("AWS_S3_REGION"),
+    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY")
+)
+S3_BUCKET = os.getenv("AWS_S3_BUCKET")
 
+JWT_SECRET = os.getenv("JWT_SECRET")
 
-# JWT secret
-JWT_SECRET = os.getenv("JWT_SECRET", "your_jwt_secret")
-
+# Step 4: Models
 class Visit(BaseModel):
     hospital: str
     date: str
@@ -43,7 +54,7 @@ class VisitResponse(Visit):
     id: int
     user_id: int
 
-
+# Step 5: JWT Token Parsing
 def get_user_id(authorization: str = Header(...)):
     try:
         token = authorization.split(" ")[1]
@@ -51,43 +62,19 @@ def get_user_id(authorization: str = Header(...)):
         return payload['userId']
     except:
         raise HTTPException(status_code=401, detail="Invalid token")
-    
-s3 = boto3.client('s3',
-    region_name=os.getenv("AWS_S3_REGION"),
-    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY")
-)
 
-S3_BUCKET = os.getenv("AWS_S3_BUCKET")
-
+# Step 6: Routes
 @app.get("/api/visits")
 def get_visits(user_id: int = Depends(get_user_id)):
-    try:
-        cur.execute("""
-            SELECT id, user_id, hospital, date, reason, doctor, notes, document_url
-            FROM visits
-            WHERE user_id = %s
-            ORDER BY date DESC
-        """, (user_id,))
-        rows = cur.fetchall()
-
-        visits = []
-        for row in rows:
-            visits.append({
-                "id": row[0],
-                "user_id": row[1],
-                "hospital": row[2],
-                "date": row[3].isoformat(),
-                "reason": row[4],
-                "doctor": row[5],
-                "notes": row[6],
-                "document_url": row[7]
-            })
-
-        return JSONResponse(content=visits)
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    cur.execute("""
+        SELECT id, user_id, hospital, date, reason, doctor, notes, document_url
+        FROM visits WHERE user_id = %s ORDER BY date DESC
+    """, (user_id,))
+    rows = cur.fetchall()
+    return JSONResponse(content=[{
+        "id": r[0], "user_id": r[1], "hospital": r[2], "date": r[3].isoformat(),
+        "reason": r[4], "doctor": r[5], "notes": r[6], "document_url": r[7]
+    } for r in rows])
 
 @app.post("/api/visits")
 def add_visit(
@@ -101,32 +88,17 @@ def add_visit(
 ):
     file_url = None
     if file:
-        file_ext = file.filename.split(".")[-1]
-        s3_key = f"documents/{uuid4()}.{file_ext}"
+        ext = file.filename.split(".")[-1]
+        s3_key = f"documents/{uuid4()}.{ext}"
         s3.upload_fileobj(
-            file.file,
-            S3_BUCKET,
-            s3_key,
-            ExtraArgs={"ACL": "public-read"}
+            file.file, S3_BUCKET, s3_key,
+            ExtraArgs={"ContentType": file.content_type, "ContentDisposition": "inline"}
         )
         file_url = f"https://{S3_BUCKET}.s3.{os.getenv('AWS_S3_REGION')}.amazonaws.com/{s3_key}"
 
-    cur.execute(
-        """
+    cur.execute("""
         INSERT INTO visits (user_id, hospital, date, reason, doctor, notes, document_url)
         VALUES (%s, %s, %s, %s, %s, %s, %s)
-        """,
-        (user_id, hospital, date, reason, doctor, notes, file_url)
-    )
+    """, (user_id, hospital, date, reason, doctor, notes, file_url))
     conn.commit()
     return {"message": "Visit added successfully"}
-
-
-# SQL for table:
-# CREATE TABLE visits (
-#     id SERIAL PRIMARY KEY,
-#     user_id INTEGER NOT NULL,
-#     hospital VARCHAR(255),
-#     date DATE,
-#     reason TEXT
-# );

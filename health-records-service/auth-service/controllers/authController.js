@@ -1,14 +1,32 @@
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
-const { pool } = require('../db');
+const { getPool } = require('../db');
 const { OAuth2Client } = require('google-auth-library');
-const client = new OAuth2Client();
+const AWS = require('aws-sdk');
 
-const JWT_SECRET = process.env.JWT_SECRET;
+let JWT_SECRET;
+let GOOGLE_CLIENT_ID;
+let oauthClient;
+
+// ✅ Load secrets from AWS once
+const loadSecrets = async () => {
+  if (JWT_SECRET && GOOGLE_CLIENT_ID) return;
+
+  const client = new AWS.SecretsManager({ region: 'us-east-2' });
+  const data = await client.getSecretValue({ SecretId: 'patient-health-system-secrets' }).promise();
+  const secrets = JSON.parse(data.SecretString);
+
+  JWT_SECRET = secrets.JWT_SECRET;
+  GOOGLE_CLIENT_ID = secrets.GOOGLE_CLIENT_ID;
+  oauthClient = new OAuth2Client(GOOGLE_CLIENT_ID);
+};
 
 // ✅ Register
 const register = async (req, res) => {
+  await loadSecrets();
+  const pool = getPool();
   const { email, password } = req.body;
+
   try {
     const hashed = await bcrypt.hash(password, 10);
     const result = await pool.query(
@@ -17,14 +35,17 @@ const register = async (req, res) => {
     );
     res.status(201).json(result.rows[0]);
   } catch (err) {
-    console.error(err);
+    console.error('❌ Registration error:', err);
     res.status(500).send('Registration error');
   }
 };
 
 // ✅ Login
 const login = async (req, res) => {
+  await loadSecrets();
+  const pool = getPool();
   const { email, password } = req.body;
+
   try {
     const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
     if (result.rows.length === 0) return res.status(401).send('Invalid credentials');
@@ -35,27 +56,25 @@ const login = async (req, res) => {
     const token = jwt.sign(
       { userId: result.rows[0].id, email: result.rows[0].email },
       JWT_SECRET,
-      { expiresIn: '1h' }
+      { expiresIn: '5m' }
     );
     res.json({ token });
   } catch (err) {
-    console.error(err);
+    console.error('❌ Login error:', err);
     res.status(500).send('Login error');
   }
-  const token = jwt.sign(
-    { userId: user.rows[0].id, email: user.rows[0].email },
-    JWT_SECRET,
-    { expiresIn: '5m' } // 🕔 expires in 5 minutes
-  );
 };
 
-// ✅ Google SSO Login
+// ✅ Google Login
 const googleLogin = async (req, res) => {
+  await loadSecrets();
+  const pool = getPool();
   const { id_token } = req.body;
+
   try {
-    const ticket = await client.verifyIdToken({
+    const ticket = await oauthClient.verifyIdToken({
       idToken: id_token,
-      audience: process.env.GOOGLE_CLIENT_ID,
+      audience: GOOGLE_CLIENT_ID,
     });
 
     const payload = ticket.getPayload();
@@ -75,18 +94,13 @@ const googleLogin = async (req, res) => {
     const token = jwt.sign(
       { userId: user.rows[0].id, email: user.rows[0].email },
       JWT_SECRET,
-      { expiresIn: '1h' }
+      { expiresIn: '5m' }
     );
     res.json({ token });
   } catch (err) {
-    console.error(err);
+    console.error('❌ Google login error:', err);
     res.status(401).send('Google login failed');
   }
-  const token = jwt.sign(
-    { userId: user.rows[0].id, email: user.rows[0].email },
-    JWT_SECRET,
-    { expiresIn: '5m' } // 🕔 expires in 5 minutes
-  );
 };
 
 module.exports = { register, login, googleLogin };

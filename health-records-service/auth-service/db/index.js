@@ -1,22 +1,26 @@
+// db.js
 const { Pool } = require('pg');
-const dotenv = require('dotenv');
-dotenv.config();
+const AWS = require('aws-sdk');
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: {
-    rejectUnauthorized: false,
-  },
-});
+let pool;
 
-const connectDB = async () => {
-  try {
-    const res = await pool.query('SELECT NOW()');
-    console.log('✅ Connected to PostgreSQL at', res.rows[0].now);
-  } catch (err) {
-    console.error('❌ DB connection error:', err);
-    process.exit(1);
-  }
+const loadSecretsAndConnect = async () => {
+  const secretsManager = new AWS.SecretsManager({ region: 'us-east-2' });
+  const data = await secretsManager.getSecretValue({ SecretId: 'patient-health-system-secrets' }).promise();
+  const secrets = JSON.parse(data.SecretString);
+
+  pool = new Pool({
+    connectionString: secrets.DATABASE_URL,
+    ssl: { rejectUnauthorized: false }
+  });
+
+  const res = await pool.query('SELECT NOW()');
+  console.log('✅ Connected to PostgreSQL at', res.rows[0].now);
 };
 
-module.exports = { pool, connectDB };
+const getPool = () => {
+  if (!pool) throw new Error('❌ Pool not initialized. Call connectDB() first.');
+  return pool;
+};
+
+module.exports = { connectDB: loadSecretsAndConnect, getPool };
